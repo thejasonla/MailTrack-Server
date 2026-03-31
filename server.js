@@ -1,70 +1,104 @@
-// MailTracker Pro - Tracking Server
-// Deploy to Railway (railway.app) or Render (render.com) for free
-//
-// HOW IT WORKS:
-// 1. Extension embeds a pixel: <img src="https://YOUR-SERVER/pixel/TRACKING_ID.gif">
-// 2. When recipient opens email & loads images, this server receives the request
-// 3. Server records the open and stores it
-// 4. Extension polls /api/opens/poll every 30s to fetch new opens
-// 5. Extension shows notification + updates UI
-
 const express = require('express');
 const cors = require('cors');
-const crypto = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ─── In-memory store (persists as long as server runs) ────────────────────────
-// For production, swap this with a real DB (Postgres, SQLite, etc.)
-const opens = new Map(); // trackingId -> [{ timestamp, userAgent, ip }]
-const pendingOpens = new Map(); // extensionKey -> [openEvent] (for polling)
+const opens = new Map();        // trackingId -> [openEvent]
+const sentMeta = new Map();     // trackingId -> { sentAt, senderIp, sessionKey }
+const pendingOpens = new Map(); // sessionKey -> [openEvent]
 
-// ─── 1x1 transparent GIF bytes ────────────────────────────────────────────────
 const TRANSPARENT_GIF = Buffer.from(
   'R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7',
   'base64'
 );
 
-// ─── Middleware ───────────────────────────────────────────────────────────────
+// Bots/scanners that are never real recipients
+const BOT_UA = [
+  'googlebot', 'bingbot', 'slurp', 'duckduckbot', 'facebookexternalhit',
+  'twitterbot', 'linkedinbot', 'whatsapp', 'telegrambot', 'applebot',
+  'scanner', 'crawler', 'spider', 'headlesschrome', 'phantomjs',
+];
+
+function isBot(ua) {
+  const u = ua.toLowerCase();
+  return BOT_UA.some(b => u.includes(b));
+}
+
+function getIp(req) {
+  return req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress || '';
+}
+
 app.use(cors({ origin: '*' }));
 app.use(express.json());
 
-// ─── TRACKING PIXEL ENDPOINT ──────────────────────────────────────────────────
-// This is the URL embedded in emails as a 1x1 image
-// URL format: /pixel/TRACKING_ID.gif
+// ─── Register sent email + sender IP ─────────────────────────────────────────
+// Called by extension immediately after sending
+app.post('/api/sent', (req, res) => {
+  const { trackingId, sentAt, sessionKey } = req.body;
+  const senderIp = getIp(req);
+  if (trackingId) {
+    sentMeta.set(trackingId, {
+      sentAt: sentAt ? new Date(sentAt).getTime() : Date.now(),
+      senderIp,
+      sessionKey: sessionKey || null,
+    });
+    console.log(`📤 Registered: ${trackingId} | sender IP: ${senderIp}`);
+  }
+  res.json({ success: true });
+});
+
+// ─── TRACKING PIXEL ───────────────────────────────────────────────────────────
 app.get('/pixel/:trackingId', (req, res) => {
-  const trackingId = req.params.trackingId
-    .replace('.gif', '')
-    .replace('.png', '')
-    .trim();
-
-  if (!trackingId || trackingId.length < 5) {
-    return sendPixel(res);
-  }
-
-  const openEvent = {
-    trackingId,
-    timestamp: new Date().toISOString(),
-    userAgent: req.headers['user-agent'] || 'Unknown',
-    ip: req.headers['x-forwarded-for']?.split(',')[0] || req.socket.remoteAddress || 'Unknown',
-  };
-
-  // Store this open
-  if (!opens.has(trackingId)) {
-    opens.set(trackingId, []);
-  }
-  opens.get(trackingId).push(openEvent);
-
-  // Queue for all polling extensions
-  // (In production, you'd match by user account. Here we broadcast to all pollers.)
-  for (const [key, queue] of pendingOpens.entries()) {
-    queue.push(openEvent);
-  }
-
-  console.log(`📬 Opened: ${trackingId} | ${openEvent.userAgent.slice(0, 60)} | ${openEvent.ip}`);
-
+  // Always send pixel immediately — don't make recipient wait
   sendPixel(res);
+
+  const trackingId = req.params.trackingId.replace(/\.(gif|png|jpg)$/i, '').trim();
+  if (!trackingId || trackingId.length < 5) return;
+
+  const ua = req.headers['user-agent'] || 'Unknown';
+  const ip = getIp(req);
+  const now = Date.now();
+
+  // Skip bots/scanners
+  if (isBot(ua)) {
+    console.log(`🤖 Bot ignored: ${trackingId} | ${ua.slice(0, 50)}`);
+    return;
+  }
+
+  const meta = sentMeta.get(trackingId);
+
+  // Skip if open happens within 15 seconds of sending (self-open on send)
+  if (meta && (now - meta.sentAt) < 15000) {
+    console.log(`⏱ Too soon after send (${now - meta.sentAt}ms), ignored: ${trackingId}`);
+    return;
+  }
+
+  // Skip if IP matches sender's IP (sender viewing their own sent mail)
+  if (meta?.senderIp && ip === meta.senderIp) {
+    console.log(`🚫 Sender self-open ignored: ${trackingId} | IP: ${ip}`);
+    return;
+  }
+
+  // Deduplicate: same IP+UA within 5 minutes = same open event
+  if (!opens.has(trackingId)) opens.set(trackingId, []);
+  const existing = opens.get(trackingId);
+  const isDupe = existing.some(o => {
+    const age = now - new Date(o.timestamp).getTime();
+    return o.ip === ip && age < 300000; // 5 min
+  });
+  if (isDupe) {
+    console.log(`🔁 Duplicate ignored: ${trackingId}`);
+    return;
+  }
+
+  const openEvent = { trackingId, timestamp: new Date().toISOString(), userAgent: ua, ip };
+  existing.push(openEvent);
+
+  // Queue for polling
+  for (const queue of pendingOpens.values()) queue.push(openEvent);
+
+  console.log(`📬 OPEN: ${trackingId} | ${ua.slice(0, 60)} | ${ip}`);
 });
 
 function sendPixel(res) {
@@ -73,83 +107,42 @@ function sendPixel(res) {
     'Cache-Control': 'no-cache, no-store, must-revalidate, private',
     'Pragma': 'no-cache',
     'Expires': '0',
-    'X-Content-Type-Options': 'nosniff',
   });
   res.send(TRANSPARENT_GIF);
 }
 
-// ─── POLLING ENDPOINT ─────────────────────────────────────────────────────────
-// Extension calls this every 30s to check for new opens
-// Returns opens since last poll, then clears the queue
-
+// ─── POLLING ─────────────────────────────────────────────────────────────────
 app.get('/api/opens/poll', (req, res) => {
-  // Use a session key from the extension (or create one)
   const sessionKey = req.headers['x-session-key'] || 'default';
-
-  if (!pendingOpens.has(sessionKey)) {
-    pendingOpens.set(sessionKey, []);
-  }
-
-  const queue = pendingOpens.get(sessionKey);
-  const newOpens = [...queue];
-  pendingOpens.set(sessionKey, []); // Clear the queue
-
+  if (!pendingOpens.has(sessionKey)) pendingOpens.set(sessionKey, []);
+  const newOpens = [...pendingOpens.get(sessionKey)];
+  pendingOpens.set(sessionKey, []);
   res.json({ opens: newOpens });
 });
 
-// ─── GET ALL OPENS FOR A TRACKING ID ─────────────────────────────────────────
 app.get('/api/opens/:trackingId', (req, res) => {
-  const trackingId = req.params.trackingId;
-  const openList = opens.get(trackingId) || [];
-  res.json({ trackingId, opens: openList, count: openList.length });
+  const list = opens.get(req.params.trackingId) || [];
+  res.json({ trackingId: req.params.trackingId, opens: list, count: list.length });
 });
 
-// ─── HEALTH CHECK ─────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
     uptime: Math.floor(process.uptime()),
     totalTracked: opens.size,
-    totalOpens: [...opens.values()].reduce((sum, arr) => sum + arr.length, 0),
+    totalOpens: [...opens.values()].reduce((s, a) => s + a.length, 0),
     timestamp: new Date().toISOString(),
   });
 });
 
-// ─── ROOT ─────────────────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
-  const totalTracked = opens.size;
-  const totalOpens = [...opens.values()].reduce((sum, arr) => sum + arr.length, 0);
-  res.send(`
-    <!DOCTYPE html>
-    <html>
-    <head>
-      <title>MailTracker Pro Server</title>
-      <style>
-        body { font-family: monospace; background: #0a0a0f; color: #e8e8f0; padding: 40px; }
-        h1 { color: #6366f1; } code { background: #18181f; padding: 2px 8px; border-radius: 4px; color: #10b981; }
-        .stat { display: inline-block; margin: 8px 16px 8px 0; }
-        .val { font-size: 2em; font-weight: bold; color: #10b981; }
-        .lbl { font-size: 0.8em; color: #6b6b80; }
-        a { color: #6366f1; }
-      </style>
-    </head>
-    <body>
-      <h1>📬 MailTracker Pro Server</h1>
-      <p>Status: <code>running</code> | Uptime: <code>${Math.floor(process.uptime())}s</code></p>
-      <div class="stat"><div class="val">${totalTracked}</div><div class="lbl">EMAILS TRACKED</div></div>
-      <div class="stat"><div class="val">${totalOpens}</div><div class="lbl">TOTAL OPENS</div></div>
-      <hr style="border-color:#22222e; margin: 24px 0">
-      <p><strong>Pixel URL format:</strong> <code>GET /pixel/{trackingId}.gif</code></p>
-      <p><strong>Poll for new opens:</strong> <code>GET /api/opens/poll</code> (with header <code>x-session-key</code>)</p>
-      <p><strong>Health check:</strong> <a href="/health">/health</a></p>
-    </body>
-    </html>
-  `);
+  const total = [...opens.values()].reduce((s, a) => s + a.length, 0);
+  res.send(`<html><body style="font-family:monospace;background:#0a0a0f;color:#e8e8f0;padding:40px">
+    <h1 style="color:#6366f1">📬 MailTracker Pro</h1>
+    <p>Status: <code style="background:#18181f;padding:2px 8px;color:#10b981">running</code> | Uptime: ${Math.floor(process.uptime())}s</p>
+    <p>Tracked: <b style="color:#10b981">${opens.size}</b> emails &nbsp;·&nbsp; <b style="color:#10b981">${total}</b> opens</p>
+    <p><a href="/health" style="color:#6366f1">/health</a></p>
+  </body></html>`);
 });
 
-// ─── START ────────────────────────────────────────────────────────────────────
-app.listen(PORT, () => {
-  console.log(`✅ MailTracker Server running on port ${PORT}`);
-  console.log(`   Pixel URL: http://localhost:${PORT}/pixel/{trackingId}.gif`);
-  console.log(`   Poll URL:  http://localhost:${PORT}/api/opens/poll`);
-});
+app.listen(PORT, () => console.log(`✅ MailTracker Server on port ${PORT}`));
